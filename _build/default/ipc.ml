@@ -1,8 +1,8 @@
-let send_frame flow buf =
-  let len = Cstruct.length buf in
+let send_frame flow msg_type buf =
+  let len = Cstruct.length msg_type + Cstruct.length buf + Cstruct.length (Cstruct.of_string " ") in
   let header = Cstruct.create 4 in
   Cstruct.BE.set_uint32 header 0 (Int32.of_int len);
-  Eio.Flow.write flow [header; buf]
+  Eio.Flow.write flow [header; msg_type; Cstruct.of_string " "; buf]
 
 let recv_frame flow =
   let header = Cstruct.create 4 in
@@ -14,7 +14,7 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-let send conn msg = send_frame conn (Cstruct.of_string (msg))
+let send conn t msg = send_frame conn (Cstruct.of_string (t)) (Cstruct.of_string (msg))
 
 let recv conn =
   let frame = recv_frame conn in
@@ -87,7 +87,9 @@ struct
       let connections = List.map (fun sub -> Eio.Net.connect ~sw net (`Unix (Subscriber.path sub))) pub.subscribers in
       while true do 
         let msg = Eio.Stream.take pub.stream in
-        List.iter (fun conn -> send conn msg) connections;
+        let idx = String.index msg ' ' in
+        
+        List.iter (fun conn -> send conn "CONTROL" (String.sub msg (idx+1) (String.length msg - idx - 1))) connections;
       done
 
   let run_server sock mu cond server_ready env =
@@ -99,26 +101,35 @@ and Subscriber : sig
   type t = {
     mutex : Eio.Mutex.t;
     path : string;
-    publisher : Publisher.t
+    publisher : Publisher.t;
+    mutable topics : string list
   }
 
   val create : string -> Publisher.t -> t
-  val path : Subscriber.t -> string
+  val path : t -> string
+  val subscribe : t -> string -> unit
   val run_client : t -> Mutex.t -> Condition.t -> bool ref -> Eio_unix.Stdenv.base -> 'a
 end =
 struct
   type t = {
     mutex : Eio.Mutex.t;
     path : string;
-    publisher : Publisher.t
+    publisher : Publisher.t;
+    mutable topics : string list
   }
 
   let create p pub = {
-    mutex = Eio.Mutex.create (); path = p; publisher = pub
+    mutex = Eio.Mutex.create (); path = p; publisher = pub; topics = []
   }
 
   let path sub = sub.path
 
+  let subscribe sub topic =
+    Eio.Mutex.lock sub.mutex;
+    sub.topics <- sub.topics @ [topic];
+    Eio.Mutex.unlock sub.mutex
+
+  
   let run_client sub mu cond server_ready env =
     Eio.Switch.run @@ fun sw ->
     let net = Eio.Stdenv.net env in
@@ -130,7 +141,7 @@ struct
     Mutex.unlock mu;
     let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    send out_conn sub.path;  (* actual message to broadcast *)
+    send out_conn "CONTROL" sub.path;  (* actual message to broadcast *)
 
     while true do
       Eio.Net.accept_fork listener ~sw ~on_error:raise
@@ -138,7 +149,12 @@ struct
           try
             while true do
               let msg = recv in_conn in
-              Eio.traceln "Client %S: received %S" sub.path msg
+              if sub.topics = [] then Eio.traceln "Received message unsubscribed";
+              List.iter (fun topic -> 
+                if Str.string_match (Str.regexp topic) msg 0 
+                  then Eio.traceln "Client %S: received %S" sub.path msg
+                  else Eio.traceln "Received message unsubscribed") sub.topics;
+              
             done
           with End_of_file -> ())
     done
@@ -165,6 +181,9 @@ let () =
 
   Publisher.add_subscriber pub sub1;
   Publisher.add_subscriber pub sub2;
+
+  Subscriber.subscribe sub1 "CONTROL";
+  Subscriber.subscribe sub2 "CONTROL";
 
   
 (* pass ready to clients, resolve to server *)
