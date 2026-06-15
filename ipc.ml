@@ -14,41 +14,47 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-module Socket =
-struct
-  type s_type = PUB | SUB
+let send conn msg = send_frame conn (Cstruct.of_string (msg))
 
+let recv conn =
+  let frame = recv_frame conn in
+  let msg = Cstruct.to_string frame in
+  msg
+
+module rec Publisher : sig
   type t = {
-    socket_type : s_type;
     mutex : Eio.Mutex.t;
-    mutable pub_paths : string list;
-    mutable sub_paths : string list;
+    path : string;
+    mutable subscribers : Subscriber.t list;
+    stream : string Eio.Stream.t
+  }
+  
+  val create : string -> t
+  val path : t -> string
+  val add_subscriber : t -> Subscriber.t -> unit
+  val run_server : t -> Mutex.t -> Condition.t -> bool ref -> Eio_unix.Stdenv.base -> unit
+end =
+struct
+  type t = {
+    mutex : Eio.Mutex.t;
+    path : string;
+    mutable subscribers : Subscriber.t list;
     stream : string Eio.Stream.t
   }
 
-  let create s = {
-    socket_type = s; mutex = Eio.Mutex.create (); pub_paths = []; sub_paths = []; stream = Eio.Stream.create max_int
+  let create p = {
+    mutex = Eio.Mutex.create (); path = p; subscribers = []; stream = Eio.Stream.create max_int
   }
 
-  let connect pub sub path =
+  let path pub = pub.path
+
+  let add_subscriber pub sub =
     Eio.Mutex.lock pub.mutex;
-    pub.pub_paths <- pub.pub_paths @ [path];
-    Eio.Mutex.unlock pub.mutex;
-    Eio.Mutex.lock sub.mutex;
-    sub.sub_paths <- sub.sub_paths @ [path];
-    Eio.Mutex.unlock sub.mutex
+    pub.subscribers <- pub.subscribers @ [sub];
+    Eio.Mutex.unlock pub.mutex
 
-  let send conn msg = send_frame conn (Cstruct.of_string (msg))
-
-  let recv conn =
-    let frame = recv_frame conn in
-    let msg = Cstruct.to_string frame in
-    msg
-
-  
-
-  let run_server_recv sock mu cond server_ready env =
-    let accept_loop server sw sock =
+  let run_recv pub mu cond server_ready env = 
+    let accept_loop server sw pub =
       while true do
         Eio.Net.accept_fork server ~sw ~on_error:raise
           (fun conn _addr ->
@@ -56,7 +62,7 @@ struct
               try
                 let msg = recv conn in
                 Eio.traceln "Server received: %S" msg;
-                Eio.Stream.add sock.stream msg;
+                Eio.Stream.add pub.stream msg;
                 loop ()
               with End_of_file -> ()
             in
@@ -66,48 +72,65 @@ struct
 
     Eio.Switch.run @@ fun sw ->
       let net = Eio.Stdenv.net env in
-      let servers = List.map (fun path ->
-        Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:5 (`Unix path)
-      ) sock.sub_paths in
+      let server = Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:5 (`Unix pub.path) in
 
       Mutex.lock mu;
       server_ready := true;
       Condition.broadcast cond;
       Mutex.unlock mu;
 
-      Eio.Fiber.all (List.map (fun server -> fun () -> accept_loop server sw sock) servers)
-  
-  let run_server_send sock env =
-    Eio.Switch.run @@ fun sw ->
-    let net = Eio.Stdenv.net env in
-    let connections = List.map (fun path ->
-      Eio.Net.connect ~sw net (`Unix path)) sock.pub_paths in
+      accept_loop server sw pub
 
-    while true do 
-      let msg = Eio.Stream.take sock.stream in
-      List.iter (fun conn -> send conn msg) connections;
-    done
-  
+  let run_send pub env =
+    Eio.Switch.run @@ fun sw ->
+      let net = Eio.Stdenv.net env in
+      let connections = List.map (fun sub -> Eio.Net.connect ~sw net (`Unix (Subscriber.path sub))) pub.subscribers in
+      while true do 
+        let msg = Eio.Stream.take pub.stream in
+        List.iter (fun conn -> send conn msg) connections;
+      done
+
   let run_server sock mu cond server_ready env =
     Eio.Fiber.both
-      (fun () -> run_server_recv sock mu cond server_ready env)
-      (fun () -> run_server_send sock env)
-    
+      (fun () -> run_recv sock mu cond server_ready env)
+      (fun () -> run_send sock env)
+end
+and Subscriber : sig 
+  type t = {
+    mutex : Eio.Mutex.t;
+    path : string;
+    publisher : Publisher.t
+  }
 
-  let run_client sock mu cond server_ready env =
+  val create : string -> Publisher.t -> t
+  val path : Subscriber.t -> string
+  val run_client : t -> Mutex.t -> Condition.t -> bool ref -> Eio_unix.Stdenv.base -> 'a
+end =
+struct
+  type t = {
+    mutex : Eio.Mutex.t;
+    path : string;
+    publisher : Publisher.t
+  }
+
+  let create p pub = {
+    mutex = Eio.Mutex.create (); path = p; publisher = pub
+  }
+
+  let path sub = sub.path
+
+  let run_client sub mu cond server_ready env =
     Eio.Switch.run @@ fun sw ->
     let net = Eio.Stdenv.net env in
-    let my_path = List.hd sock.sub_paths in
-    let server_path = List.hd sock.pub_paths in
 
-    let listener = Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:5 (`Unix my_path) in
+    let listener = Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:5 (`Unix sub.path) in
 
     Mutex.lock mu;
     while not !server_ready do Condition.wait cond mu done;
     Mutex.unlock mu;
-    let out_conn = Eio.Net.connect ~sw net (`Unix server_path) in
+    let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    send out_conn my_path;  (* actual message to broadcast *)
+    send out_conn sub.path;  (* actual message to broadcast *)
 
     while true do
       Eio.Net.accept_fork listener ~sw ~on_error:raise
@@ -115,12 +138,11 @@ struct
           try
             while true do
               let msg = recv in_conn in
-              Eio.traceln "Client %S: received %S" my_path msg
+              Eio.traceln "Client %S: received %S" sub.path msg
             done
           with End_of_file -> ())
     done
 end
-
 
 let () =
   let in_path1 = "/tmp/eio_in1.sock" in
@@ -137,14 +159,14 @@ let () =
   (* Spin up two domains: one for the server, one for the client *)
   let pool = Domainslib.Task.setup_pool ~num_domains:3 () in
 
-  let pub = Socket.create Socket.PUB in
-  let sub1 = Socket.create Socket.SUB in
-  let sub2 = Socket.create Socket.SUB in
+  let pub = Publisher.create in_path1 in
+  let sub1 = Subscriber.create out_path1 pub in
+  let sub2 = Subscriber.create out_path2 pub in
 
-  Socket.connect pub sub1 out_path1;
-  Socket.connect pub sub2 out_path2;
-  Socket.connect sub1 pub in_path1;
-  Socket.connect sub2 pub in_path2;
+  Publisher.add_subscriber pub sub1;
+  Publisher.add_subscriber pub sub2;
+
+  
 (* pass ready to clients, resolve to server *)
 
   let mu = Mutex.create () in
@@ -153,11 +175,11 @@ let () =
 
   Domainslib.Task.run pool (fun () ->
   let server = Domainslib.Task.async pool (fun () ->
-    Eio_main.run (Socket.run_server pub mu cond server_ready)) in
+    Eio_main.run (Publisher.run_server pub mu cond server_ready)) in
   let client1 = Domainslib.Task.async pool (fun () ->
-    Eio_main.run (Socket.run_client sub1 mu cond server_ready)) in
+    Eio_main.run (Subscriber.run_client sub1 mu cond server_ready)) in
   let client2 = Domainslib.Task.async pool (fun () ->
-    Eio_main.run (Socket.run_client sub2 mu cond server_ready)) in
+    Eio_main.run (Subscriber.run_client sub2 mu cond server_ready)) in
   
   Domainslib.Task.await pool server;
   Domainslib.Task.await pool client1;
