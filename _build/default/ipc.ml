@@ -1,8 +1,8 @@
-let send_frame flow msg_type buf =
-  let len = Cstruct.length msg_type + Cstruct.length buf + Cstruct.length (Cstruct.of_string " ") in
+let send_frame flow buf =
+  let len = Cstruct.length buf in
   let header = Cstruct.create 4 in
   Cstruct.BE.set_uint32 header 0 (Int32.of_int len);
-  Eio.Flow.write flow [header; msg_type; Cstruct.of_string " "; buf]
+  Eio.Flow.write flow [header; buf]
 
 let recv_frame flow =
   let header = Cstruct.create 4 in
@@ -14,12 +14,16 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-let send conn t msg = send_frame conn (Cstruct.of_string (t)) (Cstruct.of_string (msg))
+let send conn msg_type sender msg = 
+  let zmsg = msg_type ^ ";" ^ sender ^ ";" ^ msg in
+
+  send_frame conn (Cstruct.of_string zmsg)
 
 let recv conn =
   let frame = recv_frame conn in
   let msg = Cstruct.to_string frame in
-  msg
+  let split_msg = String.split_on_char ';' msg in
+  split_msg
 
 module rec Publisher : sig
   type t = {
@@ -60,9 +64,9 @@ struct
           (fun conn _addr ->
             let rec loop () =
               try
-                let msg = recv conn in
-                Eio.traceln "Server received: %S" msg;
-                Eio.Stream.add pub.stream msg;
+                let split_msg = recv conn in
+                Eio.traceln "Server received: %S;%S;%S" (List.nth split_msg 0) (List.nth split_msg 1) (List.nth split_msg 2);
+                Eio.Stream.add pub.stream (List.nth split_msg 2);
                 loop ()
               with End_of_file -> ()
             in
@@ -87,9 +91,8 @@ struct
       let connections = List.map (fun sub -> Eio.Net.connect ~sw net (`Unix (Subscriber.path sub))) pub.subscribers in
       while true do 
         let msg = Eio.Stream.take pub.stream in
-        let idx = String.index msg ' ' in
         
-        List.iter (fun conn -> send conn "CONTROL" (String.sub msg (idx+1) (String.length msg - idx - 1))) connections;
+        List.iter (fun conn -> send conn "CONTROL" "SERVER" msg) connections;
       done
 
   let run_server sock mu cond server_ready env =
@@ -141,18 +144,18 @@ struct
     Mutex.unlock mu;
     let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    send out_conn "CONTROL" sub.path;  (* actual message to broadcast *)
+    send out_conn "CONTROL" sub.path "Hello!";  (* actual message to broadcast *)
 
     while true do
       Eio.Net.accept_fork listener ~sw ~on_error:raise
         (fun in_conn _addr ->
           try
             while true do
-              let msg = recv in_conn in
+              let split_msg = recv in_conn in
               if sub.topics = [] then Eio.traceln "Received message unsubscribed";
               List.iter (fun topic -> 
-                if Str.string_match (Str.regexp topic) msg 0 
-                  then Eio.traceln "Client %S: received %S" sub.path msg
+                if Str.string_match (Str.regexp topic) (List.nth split_msg 0) 0 
+                  then Eio.traceln "Client %S: received %S;%S;%S" sub.path (List.nth split_msg 0) (List.nth split_msg 1) (List.nth split_msg 2)
                   else Eio.traceln "Received message unsubscribed") sub.topics;
               
             done
