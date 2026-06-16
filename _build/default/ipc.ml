@@ -1,3 +1,4 @@
+exception BadMessage
 let send_frame flow buf =
   let len = Cstruct.length buf in
   let header = Cstruct.create 4 in
@@ -154,39 +155,40 @@ struct
               let split_msg = recv in_conn in
               if sub.topics = [] then Eio.traceln "Received message unsubscribed";
               List.iter (fun topic -> 
-                if Str.string_match (Str.regexp topic) (List.nth split_msg 0) 0 
-                  then Eio.traceln "Client %S: received %S;%S;%S" sub.path (List.nth split_msg 0) (List.nth split_msg 1) (List.nth split_msg 2)
-                  else Eio.traceln "Received message unsubscribed") sub.topics;
-              
+                match split_msg with 
+                | tag :: sender :: payload -> 
+                  if Str.string_match (Str.regexp topic) tag 0
+                    then Eio.traceln "Client %S: received %S;%S;%S" sub.path tag sender (String.concat "" payload)
+                | _ -> raise BadMessage) sub.topics;
             done
           with End_of_file -> ())
     done
 end
 
+let create_new_subscriber id pub = 
+  let path = "/tmp/eio_out" ^ (string_of_int id) ^ ".sock" in
+  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  let sub = Subscriber.create path pub in
+  Publisher.add_subscriber pub sub;
+  sub
+
 let () =
-  let in_path1 = "/tmp/eio_in1.sock" in
-  let in_path2 = "/tmp/eio_in2.sock" in
-  let out_path1 = "/tmp/eio_out1.sock" in
-  let out_path2 = "/tmp/eio_out2.sock" in
-  
+  let in_path = "/tmp/eio_in1.sock" in
   (* Clean up any leftover socket file *)
-  (try Unix.unlink in_path1 with Unix.Unix_error _ -> ());
-  (try Unix.unlink in_path2 with Unix.Unix_error _ -> ());
-  (try Unix.unlink out_path1 with Unix.Unix_error _ -> ());
-  (try Unix.unlink out_path2 with Unix.Unix_error _ -> ());
+  (try Unix.unlink in_path with Unix.Unix_error _ -> ());
+
 
   (* Spin up two domains: one for the server, one for the client *)
-  let pool = Domainslib.Task.setup_pool ~num_domains:3 () in
+  let pool = Domainslib.Task.setup_pool ~num_domains:4 () in
 
-  let pub = Publisher.create in_path1 in
-  let sub1 = Subscriber.create out_path1 pub in
-  let sub2 = Subscriber.create out_path2 pub in
-
-  Publisher.add_subscriber pub sub1;
-  Publisher.add_subscriber pub sub2;
+  let pub = Publisher.create in_path in
+  let sub1 = create_new_subscriber 1 pub in
+  let sub2 = create_new_subscriber 2 pub in
+  let sub3 = create_new_subscriber 3 pub in
 
   Subscriber.subscribe sub1 "CONTROL";
   Subscriber.subscribe sub2 "CONTROL";
+  Subscriber.subscribe sub3 "RELAY";
 
   
 (* pass ready to clients, resolve to server *)
@@ -202,9 +204,12 @@ let () =
     Eio_main.run (Subscriber.run_client sub1 mu cond server_ready)) in
   let client2 = Domainslib.Task.async pool (fun () ->
     Eio_main.run (Subscriber.run_client sub2 mu cond server_ready)) in
+  let client3 = Domainslib.Task.async pool (fun () ->
+    Eio_main.run (Subscriber.run_client sub3 mu cond server_ready)) in
   
   Domainslib.Task.await pool server;
   Domainslib.Task.await pool client1;
-  Domainslib.Task.await pool client2
+  Domainslib.Task.await pool client2;
+  Domainslib.Task.await pool client3
   
 )
