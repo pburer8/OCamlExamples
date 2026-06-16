@@ -15,10 +15,8 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-let send conn msg_type sender msg = 
-  let zmsg = msg_type ^ ";" ^ sender ^ ";" ^ msg in
-
-  send_frame conn (Cstruct.of_string zmsg)
+let send conn lst = 
+  send_frame conn (Cstruct.of_string (String.concat ";" lst))
 
 let recv conn =
   let frame = recv_frame conn in
@@ -93,7 +91,7 @@ struct
       while true do 
         let msg = Eio.Stream.take pub.stream in
         
-        List.iter (fun conn -> send conn "CONTROL" "SERVER" msg) connections;
+        List.iter (fun conn -> send conn ["CONTROL"; "SERVER"; msg]) connections;
       done
 
   let run_server sock mu cond server_ready env =
@@ -145,7 +143,7 @@ struct
     Mutex.unlock mu;
     let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    send out_conn "CONTROL" sub.path "Hello!";  (* actual message to broadcast *)
+    send out_conn ["CONTROL"; sub.path; "Hello!"];  (* actual message to broadcast *)
 
     while true do
       Eio.Net.accept_fork listener ~sw ~on_error:raise

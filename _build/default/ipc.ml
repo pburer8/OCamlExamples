@@ -1,4 +1,52 @@
 exception BadMessage
+
+type output_message = 
+
+    (* Log message with level *)
+    | Log of int * string
+
+    (* Statistics *)
+    | Stat of string
+
+    (* Progress *)
+    | Progress of int
+        
+  
+  (* Message internal to the messaging system *)
+type control_message = 
+  (* Process is ready *)
+  | Ready
+  (* Request reply from process *)
+  | Ping
+  (* Request termination of process *)
+  | Terminate
+  (* Request resending of relay message *)
+  | Resend of int
+
+type message = 
+    (* Output to user *)
+    | OutputMessage of output_message
+    (* Message internal to the messaging system *)
+    | ControlMessage of control_message
+  
+let string_of_output_message (msg : output_message) =
+  match msg with
+  | Log (i,s) -> "LOG " ^ string_of_int i ^ " " ^ s
+  | Stat s -> "STAT " ^ s
+  | Progress i -> "PROGRESS " ^ string_of_int i
+
+let string_of_control_message (msg : control_message) =
+  match msg with
+  | Ready -> "READY"
+  | Ping -> "PING"
+  | Terminate -> "TERMINATE"
+  | Resend i -> "RESEND " ^ string_of_int i
+
+let string_of_message (msg : message) =
+  match msg with
+  | OutputMessage m -> "OUTPUT;" ^ string_of_output_message m
+  | ControlMessage m -> "CONTROL;" ^ string_of_control_message m
+
 let send_frame flow buf =
   let len = Cstruct.length buf in
   let header = Cstruct.create 4 in
@@ -15,16 +63,15 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-let send conn msg_type sender msg = 
-  let zmsg = msg_type ^ ";" ^ sender ^ ";" ^ msg in
-
-  send_frame conn (Cstruct.of_string zmsg)
+let send conn (msg : message) =
+  let msg_string = string_of_message msg in
+  send_frame conn (Cstruct.of_string msg_string)
 
 let recv conn =
   let frame = recv_frame conn in
   let msg = Cstruct.to_string frame in
-  let split_msg = String.split_on_char ';' msg in
-  split_msg
+  let tag = String.sub msg 0 (String.index msg ';') in
+  [tag; String.sub msg (String.index msg ';') (String.length msg)]
 
 module rec Publisher : sig
   type t = {
@@ -65,9 +112,9 @@ struct
           (fun conn _addr ->
             let rec loop () =
               try
-                let split_msg = recv conn in
-                Eio.traceln "Server received: %S;%S;%S" (List.nth split_msg 0) (List.nth split_msg 1) (List.nth split_msg 2);
-                Eio.Stream.add pub.stream (List.nth split_msg 2);
+                let msg = recv conn in
+                Eio.traceln "Server received: %S;%S" (List.nth msg 0) (List.nth msg 1);
+                Eio.Stream.add pub.stream (List.nth msg 1);
                 loop ()
               with End_of_file -> ()
             in
@@ -92,8 +139,8 @@ struct
       let connections = List.map (fun sub -> Eio.Net.connect ~sw net (`Unix (Subscriber.path sub))) pub.subscribers in
       while true do 
         let msg = Eio.Stream.take pub.stream in
-        
-        List.iter (fun conn -> send conn "CONTROL" "SERVER" msg) connections;
+        let zmsg = OutputMessage(Stat(msg)) in
+        List.iter (fun conn -> send conn zmsg) connections;
       done
 
   let run_server sock mu cond server_ready env =
@@ -145,7 +192,8 @@ struct
     Mutex.unlock mu;
     let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    send out_conn "CONTROL" sub.path "Hello!";  (* actual message to broadcast *)
+    let zmsg = OutputMessage(Stat("Hello!")) in
+    send out_conn zmsg;  (* actual message to broadcast *)
 
     while true do
       Eio.Net.accept_fork listener ~sw ~on_error:raise
