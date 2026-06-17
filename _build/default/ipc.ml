@@ -29,23 +29,58 @@ type message =
     (* Message internal to the messaging system *)
     | ControlMessage of control_message
   
-let string_of_output_message (msg : output_message) =
-  match msg with
-  | Log (i,s) -> "LOG " ^ string_of_int i ^ " " ^ s
-  | Stat s -> "STAT " ^ s
-  | Progress i -> "PROGRESS " ^ string_of_int i
+let strings_of_output_message = function 
+    | Log (i, s) -> ["LOG"; string_of_int i; s]
+    | Stat s -> ["STAT"; s]
+    | Progress i -> ["PROGRESS"; string_of_int i]
 
-let string_of_control_message (msg : control_message) =
-  match msg with
-  | Ready -> "READY"
-  | Ping -> "PING"
-  | Terminate -> "TERMINATE"
-  | Resend i -> "RESEND " ^ string_of_int i
 
-let string_of_message (msg : message) =
-  match msg with
-  | OutputMessage m -> "OUTPUT;" ^ string_of_output_message m
-  | ControlMessage m -> "CONTROL;" ^ string_of_control_message m
+  (* Return a message of a list of strings *)
+  let output_message_of_strings = function
+    | "LOG" :: i :: s :: _ -> (try Log (int_of_string i, s) with
+        | Invalid_argument _ ->
+            raise (Invalid_argument "output_message_of_strings a"))
+    | "STAT" :: s :: _ -> Stat s
+    | "PROGRESS" :: i :: _ -> (try Progress (int_of_string i) with 
+        | Invalid_argument _ -> 
+            raise (Invalid_argument "output_message_of_strings b"))
+    | _ -> raise (Invalid_argument "output_message_of_strings c")
+
+
+  (* Return a list of strings of a message *)
+let strings_of_control_message = function 
+  | Ready -> ["READY"]
+  | Ping -> ["PING"]
+  | Terminate -> ["TERM"]
+  | Resend i -> ["RESEND"; string_of_int i]
+
+
+  (* Return a message of a list of strings *)
+let control_message_of_strings = function
+  | "READY" :: _ -> Ready
+  | "PING" :: _ -> Ping
+  | "TERM" :: _ -> Terminate
+  | "RESEND" :: i :: _ -> (try Resend (int_of_string i) with 
+      | Invalid_argument _ -> 
+        raise (Invalid_argument "control_message_of_strings"))
+  | _ -> raise (Invalid_argument "control_message_of_strings")
+
+
+  (* Return unique tag for message type *)
+let tag_of_message = function
+    | OutputMessage _ -> "OUTPUT"
+    | ControlMessage _ -> "CONTROL"
+
+let message_of_strings payload = function
+    | "OUTPUT" -> OutputMessage (output_message_of_strings payload)
+    | "CONTROL" -> ControlMessage (control_message_of_strings payload)
+    | _ -> raise BadMessage
+
+let strings_of_message msg =
+  tag_of_message msg :: 
+  match msg with 
+  | OutputMessage m -> strings_of_output_message m
+  | ControlMessage m -> strings_of_control_message m
 
 let send_frame flow buf =
   let len = Cstruct.length buf in
@@ -63,22 +98,24 @@ let recv_frame flow =
   Eio.Flow.read_exact flow body;
   body
 
-let send conn (msg : message) =
-  let msg_string = string_of_message msg in
-  send_frame conn (Cstruct.of_string msg_string)
+let send conn msg =
+  send_frame conn (Cstruct.of_string (String.concat ";" (strings_of_message msg)))
 
 let recv conn =
   let frame = recv_frame conn in
-  let msg = Cstruct.to_string frame in
-  let tag = String.sub msg 0 (String.index msg ';') in
-  [tag; String.sub msg (String.index msg ';') (String.length msg)]
+  let str = Cstruct.to_string frame in
+  let split_msg = String.split_on_char ';' str in
+  let tag = List.hd split_msg in
+  let payload = List.tl split_msg in
+  let msg = message_of_strings payload tag in
+  msg
 
 module rec Publisher : sig
   type t = {
     mutex : Eio.Mutex.t;
     path : string;
     mutable subscribers : Subscriber.t list;
-    stream : string Eio.Stream.t
+    stream : message Eio.Stream.t
   }
   
   val create : string -> t
@@ -91,7 +128,7 @@ struct
     mutex : Eio.Mutex.t;
     path : string;
     mutable subscribers : Subscriber.t list;
-    stream : string Eio.Stream.t
+    stream : message Eio.Stream.t
   }
 
   let create p = {
@@ -113,8 +150,9 @@ struct
             let rec loop () =
               try
                 let msg = recv conn in
-                Eio.traceln "Server received: %S;%S" (List.nth msg 0) (List.nth msg 1);
-                Eio.Stream.add pub.stream (List.nth msg 1);
+                let strings = strings_of_message msg in
+                Eio.traceln "Server: received %S" (String.concat " " strings);
+                Eio.Stream.add pub.stream msg;
                 loop ()
               with End_of_file -> ()
             in
@@ -139,8 +177,7 @@ struct
       let connections = List.map (fun sub -> Eio.Net.connect ~sw net (`Unix (Subscriber.path sub))) pub.subscribers in
       while true do 
         let msg = Eio.Stream.take pub.stream in
-        let zmsg = OutputMessage(Stat(msg)) in
-        List.iter (fun conn -> send conn zmsg) connections;
+        List.iter (fun conn -> send conn msg) connections;
       done
 
   let run_server sock mu cond server_ready env =
@@ -192,7 +229,7 @@ struct
     Mutex.unlock mu;
     let out_conn = Eio.Net.connect ~sw net (`Unix (Publisher.path sub.publisher)) in
     Eio.traceln "Client: connected";
-    let zmsg = OutputMessage(Stat("Hello!")) in
+    let zmsg = OutputMessage(Stat(sub.path)) in
     send out_conn zmsg;  (* actual message to broadcast *)
 
     while true do
@@ -200,14 +237,11 @@ struct
         (fun in_conn _addr ->
           try
             while true do
-              let split_msg = recv in_conn in
-              if sub.topics = [] then Eio.traceln "Received message unsubscribed";
-              List.iter (fun topic -> 
-                match split_msg with 
-                | tag :: sender :: payload -> 
-                  if Str.string_match (Str.regexp topic) tag 0
-                    then Eio.traceln "Client %S: received %S;%S;%S" sub.path tag sender (String.concat "" payload)
-                | _ -> raise BadMessage) sub.topics;
+              let msg = recv in_conn in
+              let strings = strings_of_message msg in
+              let tag = List.hd strings in
+              if List.mem tag sub.topics
+                then Eio.traceln "Client: received %S" (String.concat " " strings)
             done
           with End_of_file -> ())
     done
@@ -234,7 +268,7 @@ let () =
   let sub2 = create_new_subscriber 2 pub in
   let sub3 = create_new_subscriber 3 pub in
 
-  Subscriber.subscribe sub1 "CONTROL";
+  Subscriber.subscribe sub1 "OUTPUT";
   Subscriber.subscribe sub2 "CONTROL";
   Subscriber.subscribe sub3 "RELAY";
 

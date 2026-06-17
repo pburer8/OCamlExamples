@@ -1,7 +1,3 @@
 (executable
  (name ipc)
  (libraries eio eio_main cstruct fmt domainslib str))
-
-(executable
- (name kind2ipc)
- (libraries eio eio_main cstruct fmt domainslib str))
